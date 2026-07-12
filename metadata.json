@@ -1,0 +1,6 @@
+{
+  "name": "Ambient Clock",
+  "description": "Full-screen landscape ambient clock & weather display for smart displays",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
