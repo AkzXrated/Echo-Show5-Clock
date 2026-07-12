@@ -53,26 +53,6 @@ class WeatherRepository(private val context: Context) {
         }
     }
 
-    fun getApiKey(): String {
-        // First check SharedPreferences
-        val savedKey = prefs.getString("owm_api_key", "") ?: ""
-        if (savedKey.trim().isNotEmpty()) {
-            return savedKey.trim()
-        }
-        // Fallback to BuildConfig if available
-        val configKey = try {
-            val field = BuildConfig::class.java.getField("OPENWEATHER_API_KEY")
-            field.get(null) as? String ?: ""
-        } catch (e: Exception) {
-            ""
-        }
-        if (configKey.trim().isNotEmpty() && !configKey.startsWith("MY_OPENWEATHER") && !configKey.contains("placeholder", ignoreCase = true)) {
-            return configKey.trim()
-        }
-        // Fallback to user's hardcoded personal key
-        return "AIzaSyCZGW15NUKSfCmX08fwMxmlceylpKr3u08"
-    }
-
     private fun calculateMoonPhase(timeMs: Long): Float {
         val baseMs = 947182440000L // New moon Jan 6, 2000 18:14 UTC
         val synodicMonthMs = 29.530588853 * 24 * 60 * 60 * 1000L
