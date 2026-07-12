@@ -45,13 +45,19 @@ class WeatherDetailOverlay @JvmOverloads constructor(
         // Immersive glassmospheric dark overlay background
         setBackgroundColor(Color.parseColor("#EC060B1E")) // deep dark space slate violet
         alpha = 0f
-        
+        scaleX = 0.96f
+        scaleY = 0.96f
+        translationY = 12f * resources.displayMetrics.density
+
         // Block lower clicks from leaking
         setOnClickListener { /* consume */ }
 
         setupMainLayout()
         updateSelectedDayUI()
-        animate().alpha(1f).setDuration(250).start()
+        animate().alpha(1f).scaleX(1f).scaleY(1f).translationY(0f)
+            .setDuration(280)
+            .setInterpolator(android.view.animation.DecelerateInterpolator(1.5f))
+            .start()
     }
 
     private fun setupMainLayout() {
@@ -494,9 +500,12 @@ class WeatherDetailOverlay @JvmOverloads constructor(
     }
 
     private fun dismiss() {
-        animate().alpha(0f).setDuration(250).withEndAction {
-            (parent as? ViewGroup)?.removeView(this)
-        }.start()
+        animate().alpha(0f).scaleX(0.97f).scaleY(0.97f)
+            .translationY(8f * resources.displayMetrics.density)
+            .setDuration(200)
+            .setInterpolator(android.view.animation.AccelerateInterpolator())
+            .withEndAction { (parent as? ViewGroup)?.removeView(this) }
+            .start()
     }
 
     // Custom Canvas drawings helper for weather condition vectors

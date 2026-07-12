@@ -78,6 +78,14 @@ class AmbientSurfaceView @JvmOverloads constructor(
 
     // Timers
     private var lastUpdateTime = System.nanoTime()
+    @Volatile private var frameDt = 0.033f // last frame delta seconds, set once per frame in run()
+
+    // Shared RNG (never allocate per frame)
+    private val rand = java.util.Random()
+
+    // Solar position, recomputed each frame in drawLayers and shared by all layers
+    private var sunAltitudeDeg = 0f
+    private var sunAzimuthDeg = 180f
 
     // Paint pool (instantiated once)
     private val skyPaint = Paint().apply { isDither = true }
@@ -100,6 +108,94 @@ class AmbientSurfaceView @JvmOverloads constructor(
     private val shootingStarPaint = Paint().apply { isAntiAlias = true; strokeWidth = 2f; style = Paint.Style.STROKE }
     private val ambientPaint = Paint().apply { isAntiAlias = true; style = Paint.Style.FILL; color = Color.WHITE }
 
+    // Celestial body paints (shared by sun and moon renderers)
+    private val celestialPaint = Paint().apply { isAntiAlias = true }
+    private val celestialGlowPaint = Paint().apply { isAntiAlias = true; style = Paint.Style.FILL }
+    private val celestialRayPaint = Paint().apply { isAntiAlias = true; style = Paint.Style.STROKE; strokeCap = Paint.Cap.ROUND }
+    private val horizonGlowPaint = Paint().apply { isAntiAlias = true; style = Paint.Style.FILL }
+    private val lightningGlowPaint = Paint().apply { isAntiAlias = true; style = Paint.Style.FILL }
+
+    // Position-independent shaders built once; drawn around a translated origin
+    private val sunGlowShader = RadialGradient(0f, 0f, 280f, intArrayOf(
+        Color.argb(110, 253, 224, 71), Color.argb(38, 249, 115, 22),
+        Color.argb(10, 234, 88, 12), Color.argb(0, 234, 88, 12)
+    ), floatArrayOf(0.0f, 0.35f, 0.75f, 1.0f), Shader.TileMode.CLAMP)
+    private val moonGlowShader = RadialGradient(0f, 0f, 240f, intArrayOf(
+        Color.argb(75, 224, 242, 254), Color.argb(25, 186, 230, 253),
+        Color.argb(6, 14, 165, 233), Color.argb(0, 14, 165, 233)
+    ), floatArrayOf(0.0f, 0.35f, 0.75f, 1.0f), Shader.TileMode.CLAMP)
+    private val sunCoreShader = RadialGradient(0f, 0f, 24f, intArrayOf(
+        Color.rgb(253, 224, 71), Color.rgb(249, 115, 22), Color.rgb(234, 88, 12)
+    ), null, Shader.TileMode.CLAMP)
+    private val moonHaloShader = RadialGradient(0f, 0f, 45f, intArrayOf(
+        Color.argb(80, 186, 230, 253), Color.argb(0, 186, 230, 253)
+    ), null, Shader.TileMode.CLAMP)
+    private val moonBodyShader = LinearGradient(-15f, -15f, 15f, 15f,
+        Color.rgb(254, 240, 138), Color.rgb(251, 191, 36), Shader.TileMode.CLAMP)
+    // Unit-radius radial glows: place with canvas.translate + canvas.scale
+    private val horizonGlowShader = RadialGradient(0f, 0f, 1f, intArrayOf(
+        Color.argb(255, 255, 140, 66), Color.argb(90, 255, 110, 60), Color.argb(0, 255, 100, 60)
+    ), floatArrayOf(0f, 0.45f, 1f), Shader.TileMode.CLAMP)
+    private val lightningGlowShader = RadialGradient(0f, 0f, 1f, intArrayOf(
+        Color.argb(160, 190, 220, 255), Color.argb(60, 150, 190, 255), Color.argb(0, 140, 180, 255)
+    ), floatArrayOf(0f, 0.4f, 1f), Shader.TileMode.CLAMP)
+    private val fireflyGlowShader = RadialGradient(0f, 0f, 1f, intArrayOf(
+        Color.argb(200, 180, 255, 0), Color.argb(0, 180, 255, 0)
+    ), null, Shader.TileMode.CLAMP)
+
+    // Sky gradient shader cache: rebuilt only when the blended colors change
+    private var skyShaderTop = 1
+    private var skyShaderBottom = 1
+
+    // Cached blur filters (allocating BlurMaskFilter per frame is expensive)
+    private val blur40 = BlurMaskFilter(40f, BlurMaskFilter.Blur.NORMAL)
+    private val blur20 = BlurMaskFilter(20f, BlurMaskFilter.Blur.NORMAL)
+    private val blur8 = BlurMaskFilter(8f, BlurMaskFilter.Blur.NORMAL)
+    private val blur15 = BlurMaskFilter(15f, BlurMaskFilter.Blur.NORMAL)
+    private val blur6 = BlurMaskFilter(6f, BlurMaskFilter.Blur.NORMAL)
+
+    // Bottom info bar paints (configured per frame, allocated once)
+    private val tempPaint = Paint().apply { isAntiAlias = true; typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL); color = Color.WHITE }
+    private val tempGlowPaint = Paint().apply { isAntiAlias = true; typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL) }
+    private val descPaint = Paint().apply { isAntiAlias = true; typeface = Typeface.create("sans-serif-medium", Typeface.BOLD) }
+    private val locationPaint = Paint().apply { isAntiAlias = true; typeface = Typeface.create("sans-serif", Typeface.BOLD) }
+    private val metricPaint = Paint().apply { isAntiAlias = true; typeface = Typeface.create("sans-serif", Typeface.BOLD) }
+    private val triPaint = Paint().apply { isAntiAlias = true; style = Paint.Style.FILL }
+    private val dividerPaint = Paint().apply { isAntiAlias = true; style = Paint.Style.STROKE }
+    private var dividerShaderAlpha = -1
+    private val triPathUp = Path()
+    private val triPathDown = Path()
+    private val fogPath = Path()
+
+    // Mini icon shared resources
+    private val iconPaint = Paint().apply { isAntiAlias = true }
+    private val baseCloudPath = Path().apply {
+        addCircle(-15f, 3f, 11f, Path.Direction.CW)
+        addCircle(15f, 4f, 10f, Path.Direction.CW)
+        addCircle(0f, -8f, 16f, Path.Direction.CW)
+        addRoundRect(RectF(-22f, 1f, 22f, 15f), 7f, 7f, Path.Direction.CW)
+    }
+    private val dropletPath = Path().apply {
+        moveTo(0f, -35f)
+        cubicTo(20f, 0f, 25f, 25f, 0f, 35f)
+        cubicTo(-25f, 25f, -20f, 0f, 0f, -35f)
+        close()
+    }
+    private val dropletPaint = Paint().apply {
+        isAntiAlias = true
+        style = Paint.Style.FILL
+        shader = LinearGradient(0f, -30f, 0f, 35f,
+            Color.rgb(96, 165, 250), Color.rgb(37, 99, 235), Shader.TileMode.CLAMP)
+    }
+    private val windTrackPaint = Paint().apply { isAntiAlias = true; style = Paint.Style.STROKE; color = Color.argb(80, 203, 213, 225); strokeWidth = 6f; strokeCap = Paint.Cap.ROUND }
+    private val windFlowPaint = Paint().apply { isAntiAlias = true; style = Paint.Style.STROKE; color = Color.rgb(241, 245, 249); strokeWidth = 6f; strokeCap = Paint.Cap.ROUND }
+    private val windPath = Path().apply {
+        moveTo(-45f, 0f)
+        lineTo(15f, 0f)
+        cubicTo(32f, 0f, 32f, -18f, 18f, -18f)
+        cubicTo(8f, -18f, 8f, -6f, 16f, -6f)
+    }
+
     // Text & Glow drawing paints (Off-screen clock canvas)
     private val clockFontPaint = Paint().apply {
         isAntiAlias = true
@@ -120,8 +216,28 @@ class AmbientSurfaceView @JvmOverloads constructor(
         textSize = 21f
     }
 
+    // Clock cache: digits+AM/PM and colon live in separate bitmaps re-rendered
+    // once per minute; the colon breathes via bitmap-draw alpha, and minute
+    // changes crossfade between prev/current bitmaps.
     private var clockBmp: Bitmap? = null
     private var clockCanvas: Canvas? = null
+    private var prevClockBmp: Bitmap? = null
+    private var prevClockCanvas: Canvas? = null
+    private var colonBmp: Bitmap? = null
+    private var colonCanvas: Canvas? = null
+    private var cachedClockMinute = -1
+    private var clockSwapTimeMs = 0L
+    private var clockBaselineInBmp = 0f
+    private val clockBmpPaint = Paint().apply { isFilterBitmap = true }
+    private val colonBmpPaint = Paint().apply { isFilterBitmap = true }
+    private val amPmPaint = Paint().apply {
+        isAntiAlias = true
+        typeface = Typeface.create("sans-serif", Typeface.BOLD)
+    }
+    private val amPmGlowPaint = Paint().apply {
+        isAntiAlias = true
+        typeface = Typeface.create("sans-serif", Typeface.BOLD)
+    }
 
     // Touch and action listeners for weather bottom bar
     var onWeatherBarClicked: (() -> Unit)? = null
@@ -134,7 +250,6 @@ class AmbientSurfaceView @JvmOverloads constructor(
     }
 
     private fun initParticles() {
-        val rand = java.util.Random()
         // Initialize ambient floaters spread out
         for (p in ambientParticles) {
             p.x = rand.nextFloat() * viewWidth
@@ -144,14 +259,24 @@ class AmbientSurfaceView @JvmOverloads constructor(
             p.size = 2f + rand.nextFloat() * 2f
             p.alpha = 0.15f + rand.nextFloat() * 0.2f
         }
-        // Rain particles spread initially
-        for (p in rainParticles) {
+        // Rain particles spread initially, interleaved across two depth layers
+        // (far = slow/short/dim behind, near = fast/long/bright in front) so any
+        // intensity-scaled active count keeps a mix of both depths.
+        for ((i, p) in rainParticles.withIndex()) {
+            p.layer = if (i % 5 < 3) 0 else 1
             p.x = rand.nextFloat() * viewWidth
             p.y = rand.nextFloat() * viewHeight
-            p.vy = 400f + rand.nextFloat() * 300f
-            p.vx = weatherState.windSpeed * 8f
-            p.alpha = 0.3f + rand.nextFloat() * 0.3f
-            p.length = 12f + rand.nextFloat() * 8f
+            if (p.layer == 0) {
+                p.vy = 260f + rand.nextFloat() * 160f
+                p.vx = weatherState.windSpeed * 5f
+                p.alpha = 0.22f + rand.nextFloat() * 0.22f
+                p.length = 7f + rand.nextFloat() * 5f
+            } else {
+                p.vy = 520f + rand.nextFloat() * 260f
+                p.vx = weatherState.windSpeed * 8f
+                p.alpha = 0.38f + rand.nextFloat() * 0.3f
+                p.length = 16f + rand.nextFloat() * 9f
+            }
         }
         // Snow particles spread initially
         for (p in snowParticles) {
@@ -210,11 +335,16 @@ class AmbientSurfaceView @JvmOverloads constructor(
         viewHeight = height.toFloat()
         Log.d(TAG, "Surface sized changed: $width x $height")
 
-        // Reallocate the clock text cache bitmap fitting the screen sizes
+        // Reallocate the clock text cache bitmaps fitting the screen sizes
         val clockW = (width * 0.95f).toInt().coerceAtLeast(800)
         val clockH = (height * 0.65f).toInt().coerceAtLeast(300)
         clockBmp = Bitmap.createBitmap(clockW, clockH, Bitmap.Config.ARGB_8888)
         clockCanvas = Canvas(clockBmp!!)
+        prevClockBmp = Bitmap.createBitmap(clockW, clockH, Bitmap.Config.ARGB_8888)
+        prevClockCanvas = Canvas(prevClockBmp!!)
+        colonBmp = Bitmap.createBitmap(clockW, clockH, Bitmap.Config.ARGB_8888)
+        colonCanvas = Canvas(colonBmp!!)
+        cachedClockMinute = -1
 
         initParticles()
     }
@@ -238,6 +368,7 @@ class AmbientSurfaceView @JvmOverloads constructor(
             val nowNano = System.nanoTime()
             val deltaTimeSec = ((nowNano - lastUpdateTime) / 1000000000.0).toFloat().coerceIn(0.001f, 0.1f)
             lastUpdateTime = nowNano
+            frameDt = deltaTimeSec
 
             updatePhysics(deltaTimeSec)
 
@@ -295,7 +426,6 @@ class AmbientSurfaceView @JvmOverloads constructor(
      */
     private fun updatePhysics(dt: Float) {
         val nowMs = System.currentTimeMillis()
-        val rand = java.util.Random()
 
         // 1. Stars stable position regeneration check (by day of year)
         val cal = Calendar.getInstance(TimeZone.getTimeZone("Asia/Kolkata"))
@@ -309,6 +439,14 @@ class AmbientSurfaceView @JvmOverloads constructor(
                 s.baseAlpha = 0.3f + starRand.nextFloat() * 0.7f
                 s.speed = 1.0f + starRand.nextFloat() * 2.5f
                 s.offset = starRand.nextFloat() * 100f
+                s.size = 0.8f + starRand.nextFloat() * 1.1f
+                // Subtle stellar color variety: mostly white, some blue-white, a few warm
+                val tintRoll = starRand.nextFloat()
+                when {
+                    tintRoll < 0.18f -> { s.tintR = 190; s.tintG = 215; s.tintB = 255 }
+                    tintRoll < 0.30f -> { s.tintR = 255; s.tintG = 226; s.tintB = 190 }
+                    else -> { s.tintR = 255; s.tintG = 255; s.tintB = 255 }
+                }
             }
         }
 
@@ -365,8 +503,13 @@ class AmbientSurfaceView @JvmOverloads constructor(
                 if (p.y > viewHeight || p.x < -20 || p.x > viewWidth + 20) {
                     p.y = -20f
                     p.x = rand.nextFloat() * viewWidth
-                    p.vy = 450f + rand.nextFloat() * 250f
-                    p.vx = weatherState.windSpeed * 8f
+                    if (p.layer == 0) {
+                        p.vy = 280f + rand.nextFloat() * 160f
+                        p.vx = weatherState.windSpeed * 5f
+                    } else {
+                        p.vy = 520f + rand.nextFloat() * 260f
+                        p.vx = weatherState.windSpeed * 8f
+                    }
 
                     // Spawn a small water splash at bottom
                     for (sp in splashParticles) {
@@ -569,76 +712,12 @@ class AmbientSurfaceView @JvmOverloads constructor(
      * Compute and blend sky gradients, celestial arc, and weather layers.
      */
     private fun drawLayers(canvas: Canvas) {
-        val rand = java.util.Random()
-        val nowSec = System.currentTimeMillis() / 1000L
+        val timeMs = System.currentTimeMillis()
         val isDay = isDayTime()
 
         // -------------------------------------------------------------
-        // LAYER 1 — SKY GRADIENT (always)
+        // LAYER 0 — SOLAR POSITION (drives the sky palette + celestial arc)
         // -------------------------------------------------------------
-        // Sky states parameters
-        val dawnDuskWindow = 1800L // 30 minutes in seconds
-
-        // Determine target colors
-        val targetTop: Int
-        val targetBottom: Int
-
-        // Determine if currently in Dawn or Dusk window of sunrise/sunset
-        val nearSunrise = abs(nowSec - weatherState.sunriseEpoch) <= dawnDuskWindow
-        val nearSunset = abs(nowSec - weatherState.sunsetEpoch) <= dawnDuskWindow
-
-        val isStorm = weatherState.conditionId in 200..232 || weatherState.conditionId in 300..531
-        val isCloudy = weatherState.cloudCover > 50
-
-        when {
-            nearSunrise || nearSunset -> {
-                // Dawn/Dusk state
-                targetTop = Color.parseColor("#1A0B30")
-                targetBottom = Color.parseColor("#FF6B35")
-            }
-            !isDay -> {
-                // Night sky state
-                targetTop = Color.parseColor("#03050F")
-                targetBottom = Color.parseColor("#0A1128")
-            }
-            isStorm -> {
-                // Rain/Storm state
-                targetTop = Color.parseColor("#1C2833")
-                targetBottom = Color.parseColor("#2C3E50")
-            }
-            isCloudy -> {
-                // Cloudy day state
-                targetTop = Color.parseColor("#37474F")
-                targetBottom = Color.parseColor("#78909C")
-            }
-            else -> {
-                // Day clear state
-                targetTop = Color.parseColor("#1565C0")
-                targetBottom = Color.parseColor("#42A5F5")
-            }
-        }
-
-        // Smoothly update rendered colors over 3 minutes (180 seconds).
-        // Since this ticks at ~30 FPS, we use a small update proportion: dt is roughly 0.033s.
-        // Blending factor: ~0.033 / 180 per frame.
-        val dt = (System.nanoTime() - lastUpdateTime - 0L) / 1000000000.0f
-        val step = (if (dt > 0.001f) dt else 0.033f) / 180f
-        renderedTopColor = lerpColor(renderedTopColor, targetTop, step)
-        renderedBottomColor = lerpColor(renderedBottomColor, targetBottom, step)
-
-        // Draw background gradient
-        val shader = LinearGradient(
-            0f, 0f, 0f, viewHeight,
-            renderedTopColor, renderedBottomColor, Shader.TileMode.CLAMP
-        )
-        skyPaint.shader = shader
-        canvas.drawRect(0f, 0f, viewWidth, viewHeight, skyPaint)
-
-
-        // -------------------------------------------------------------
-        // LAYER 2 — SUN OR MOON ARC
-        // -------------------------------------------------------------
-        // Calculate solar calculations in standard equations
         val cal = Calendar.getInstance(TimeZone.getTimeZone("Asia/Kolkata"))
         val dayOfYear = cal.get(Calendar.DAY_OF_YEAR)
         val hour = cal.get(Calendar.HOUR_OF_DAY)
@@ -649,12 +728,7 @@ class AmbientSurfaceView @JvmOverloads constructor(
         // Solar Declination (radians)
         val declination = (0.409 * sin((2.0 * Math.PI / 365.0) * (dayOfYear - 80))).toFloat()
 
-        // Local Solar Time Meridian: Asia/Kolkata is UTC+5.5.
-        // Longitude factor: Thalassery LON = 75.4908891.
-        // Difference between LON and local standard time meridian (82.5°E for India IST):
-        // Longitude offset is (LON - StandardMeridian) in degrees * 4 mins/degree, etc.
-        // Let's use simple local hours:
-        // Dec = Declination. Solar hour angle H = (solar_hour_fraction - 12) * 15 degrees in rad.
+        // Solar hour angle from local solar time (82.5°E is India's IST meridian)
         val localSolarTime = timeFraction + (WeatherRepository.LON - 82.5f) / 15.0f
         val hourAngle = ((localSolarTime - 12.0) * (Math.PI / 12.0)).toFloat()
         val latRad = (WeatherRepository.LAT * Math.PI / 180.0).toFloat()
@@ -662,7 +736,7 @@ class AmbientSurfaceView @JvmOverloads constructor(
         // Solar Altitude h: sin(h) = sin(lat)*sin(dec) + cos(lat)*cos(dec)*cos(H)
         val sinElev = sin(latRad) * sin(declination) + cos(latRad) * cos(declination) * cos(hourAngle)
         val altitude = asin(sinElev)
-        val altitudeDeg = (altitude * 180.0 / Math.PI).toFloat()
+        sunAltitudeDeg = (altitude * 180.0 / Math.PI).toFloat()
 
         // Standard Max Elevation (Hour Angle H = 0)
         val sinMaxElev = sin(latRad) * sin(declination) + cos(latRad) * cos(declination)
@@ -676,156 +750,123 @@ class AmbientSurfaceView @JvmOverloads constructor(
         if (sin(hourAngle) > 0) {
             azimuth = (2.0 * Math.PI).toFloat() - azimuth
         }
-        val azimuthDeg = (azimuth * 180.0 / Math.PI).toFloat()
+        sunAzimuthDeg = (azimuth * 180.0 / Math.PI).toFloat()
 
-        // Screen mapping
-        // Visible horizontal arc: 60 to 300 degrees
-        val celX = viewWidth * (azimuthDeg - 60f) / 240f
+        // Screen mapping: visible horizontal arc is 60..300 degrees azimuth
+        val celX = viewWidth * (sunAzimuthDeg - 60f) / 240f
         val celY = viewHeight * 0.85f * (1.0f - (sin(altitude) / sin(maxAltitude)).toFloat().coerceIn(0f, 1f))
 
-        // Draw Celestial body if above -5 degrees elevation
-        if (altitudeDeg >= -5.0f) {
-            if (isDay) {
-                // Draw majestic Meteocon Sun with expansive sunlight glow and rotating rays in standard background sky position
+        // -------------------------------------------------------------
+        // LAYER 1 — SKY GRADIENT: continuous 24h palette from sun altitude
+        // (deep night → astronomical twilight → blue hour → golden hour → day)
+        // -------------------------------------------------------------
+        val skyPair = skyColorsForAltitude(sunAltitudeDeg)
+        var targetTop = skyPair.first
+        var targetBottom = skyPair.second
+
+        // Weather blending: pull the palette toward slate greys for cloud/storm,
+        // scaled darker at night so overcast nights stay properly dark.
+        val condNow = weatherState.conditionId
+        val isStorm = condNow in 200..232 || condNow in 300..531
+        val dayFactor = ((sunAltitudeDeg + 6f) / 26f).coerceIn(0f, 1f)
+        if (isStorm || weatherState.cloudCover > 50) {
+            val greyTop = lerpColor(Color.parseColor("#0D1218"), Color.parseColor("#37474F"), dayFactor)
+            val greyBottom = lerpColor(Color.parseColor("#161E27"), Color.parseColor("#78909C"), dayFactor)
+            val mix = if (isStorm) 0.7f else (weatherState.cloudCover / 100f) * 0.55f
+            targetTop = lerpColor(targetTop, greyTop, mix)
+            targetBottom = lerpColor(targetBottom, greyBottom, mix)
+        }
+
+        // Ease the rendered sky toward the target (~30s exponential approach)
+        val step = (frameDt / 30f).coerceAtMost(1f)
+        renderedTopColor = lerpColor(renderedTopColor, targetTop, step)
+        renderedBottomColor = lerpColor(renderedBottomColor, targetBottom, step)
+
+        // Rebuild the gradient shader only when the blended colors actually move
+        if (renderedTopColor != skyShaderTop || renderedBottomColor != skyShaderBottom) {
+            skyShaderTop = renderedTopColor
+            skyShaderBottom = renderedBottomColor
+            skyPaint.shader = LinearGradient(
+                0f, 0f, 0f, viewHeight,
+                renderedTopColor, renderedBottomColor, Shader.TileMode.CLAMP
+            )
+        }
+        canvas.drawRect(0f, 0f, viewWidth, viewHeight, skyPaint)
+
+        // Horizon glow hugging the bottom edge near the sun during golden/blue hour
+        if (!isStorm && sunAltitudeDeg > -9f && sunAltitudeDeg < 9f) {
+            val glowStrength = (1f - abs(sunAltitudeDeg) / 9f).coerceIn(0f, 1f)
+            horizonGlowPaint.shader = horizonGlowShader
+            horizonGlowPaint.alpha = (glowStrength * 110f).toInt()
+            canvas.save()
+            canvas.translate(celX, viewHeight * 1.02f)
+            canvas.scale(viewWidth * 0.55f, viewHeight * 0.38f)
+            canvas.drawCircle(0f, 0f, 1f, horizonGlowPaint)
+            canvas.restore()
+        }
+
+        // Sun rides the solar arc; the moon rides the anti-solar arc so it is
+        // actually up at night (the old code drew it at the sun's position,
+        // which is below the horizon all night — the moon never appeared).
+        if (isDay && sunAltitudeDeg >= -5.0f) {
+            // Majestic sun with expansive glow and rotating rays
+            canvas.save()
+            canvas.translate(celX, celY)
+            canvas.scale(1.1f, 1.1f)
+
+            val spin = (timeMs % 32000L) / 32000f * 360f // majestic, slow rotation
+            val scaleG = 1f + 0.05f * sin(timeMs / 800.0).toFloat()
+
+            // 1. Large ambient sunlight glow (pre-built shader)
+            celestialGlowPaint.shader = sunGlowShader
+            celestialGlowPaint.alpha = 255
+            canvas.drawCircle(0f, 0f, 280f, celestialGlowPaint)
+
+            // 2. Long breathing rays
+            val pulse = (1f + 0.08f * sin(timeMs / 1200.0).toFloat())
+            val raySpin = (timeMs % 48000L) / 48000f * 360f
+            celestialRayPaint.shader = null
+            celestialRayPaint.color = Color.argb(60, 255, 244, 200)
+            for (i in 0 until 12) {
                 canvas.save()
-                canvas.translate(celX, celY)
-                canvas.scale(1.1f, 1.1f)
-
-                val localPaint = Paint().apply { isAntiAlias = true }
-                val timeMs = System.currentTimeMillis()
-                val spin = (timeMs % 32000L) / 32000f * 360f // majestic, slow rotation
-                val scaleG = 1f + 0.05f * sin(timeMs / 800.0).toFloat()
-
-                // 1. Draw large background ambient sunlight glow
-                val glowPaint = Paint().apply { isAntiAlias = true; style = Paint.Style.FILL }
-                val sunGlowColors = intArrayOf(
-                    Color.argb(110, 253, 224, 71), // central gold glow matching sun yellow
-                    Color.argb(38, 249, 115, 22),   // warming orange transition
-                    Color.argb(10, 234, 88, 12),    // extremely subtle outer warm boundary
-                    Color.argb(0, 234, 88, 12)     // completely fading out smoothly
-                )
-                glowPaint.shader = RadialGradient(0f, 0f, 280f, sunGlowColors, floatArrayOf(0.0f, 0.35f, 0.75f, 1.0f), Shader.TileMode.CLAMP)
-                canvas.drawCircle(0f, 0f, 280f, glowPaint)
-
-                // 2. Draw modern, elegant long rays following the sun's position
-                val rayPaint = Paint().apply {
-                    isAntiAlias = true
-                    style = Paint.Style.STROKE
-                    strokeCap = Paint.Cap.ROUND
-                }
-                val pulse = (1f + 0.08f * sin(timeMs / 1200.0).toFloat()) // slow cosmic pulsing
-                val raySpin = (timeMs % 48000L) / 48000f * 360f // independent slower ray rotation
-
-                for (i in 0 until 12) {
-                    canvas.save()
-                    canvas.rotate(i * 30f + raySpin)
-                    val startDist = 48f * scaleG
-                    val endDist = (125f + 25f * sin(timeMs / 1000.0 + i).toFloat()) * pulse
-                    
-                    rayPaint.shader = LinearGradient(0f, startDist, 0f, endDist,
-                        Color.argb(75, 255, 244, 200),
-                        Color.argb(0, 253, 224, 71),
-                        Shader.TileMode.CLAMP
-                    )
-                    rayPaint.strokeWidth = 3f + 1.5f * sin(timeMs / 1000.0 + i).toFloat()
-                    canvas.drawLine(0f, startDist, 0f, endDist, rayPaint)
-                    canvas.restore()
-                }
-
-                // 3. Glowing golden sun core with dynamic radius
-                localPaint.style = Paint.Style.FILL
-                localPaint.shader = RadialGradient(0f, 0f, 24f * scaleG,
-                    intArrayOf(Color.rgb(253, 224, 71), Color.rgb(249, 115, 22), Color.rgb(234, 88, 12)),
-                    null, Shader.TileMode.CLAMP
-                )
-                canvas.drawCircle(0f, 0f, 24f * scaleG, localPaint)
-
-                // 4. Rotating pill spokes
-                localPaint.shader = null
-                localPaint.style = Paint.Style.STROKE
-                localPaint.strokeWidth = 5.5f
-                localPaint.strokeCap = Paint.Cap.ROUND
-                localPaint.color = Color.rgb(249, 115, 22)
-
-                for (i in 0 until 8) {
-                    canvas.save()
-                    canvas.rotate(i * 45f + spin)
-                    canvas.drawLine(0f, 31f * scaleG, 0f, 40f * scaleG, localPaint)
-                    canvas.restore()
-                }
+                canvas.rotate(i * 30f + raySpin)
+                val startDist = 48f * scaleG
+                val endDist = (125f + 25f * sin(timeMs / 1000.0 + i).toFloat()) * pulse
+                celestialRayPaint.strokeWidth = 3f + 1.5f * sin(timeMs / 1000.0 + i).toFloat()
+                canvas.drawLine(0f, startDist, 0f, endDist, celestialRayPaint)
                 canvas.restore()
-            } else {
-                // Draw gorgeous Meteocon crescent moon and elegant star glow with serene moonlight glow and rays
+            }
+
+            // 3. Golden sun core (fixed-radius shader, sized via canvas scale)
+            celestialPaint.style = Paint.Style.FILL
+            celestialPaint.shader = sunCoreShader
+            canvas.save()
+            canvas.scale(scaleG, scaleG)
+            canvas.drawCircle(0f, 0f, 24f, celestialPaint)
+            canvas.restore()
+
+            // 4. Rotating pill spokes
+            celestialPaint.shader = null
+            celestialPaint.style = Paint.Style.STROKE
+            celestialPaint.strokeWidth = 5.5f
+            celestialPaint.strokeCap = Paint.Cap.ROUND
+            celestialPaint.color = Color.rgb(249, 115, 22)
+            for (i in 0 until 8) {
                 canvas.save()
-                canvas.translate(celX, celY)
-                canvas.scale(1.2f, 1.2f)
-
-                val localPaint = Paint().apply { isAntiAlias = true }
-                val timeMs = System.currentTimeMillis()
-                val rock = 4f * sin(timeMs / 2000.0).toFloat() // beautiful slow swaying
-
-                // 1. Draw large background ambient moonlight glow (lighter, serene sky-blue glow)
-                val glowPaint = Paint().apply { isAntiAlias = true; style = Paint.Style.FILL }
-                val moonGlowColors = intArrayOf(
-                    Color.argb(75, 224, 242, 254), // serene light blue-white glow
-                    Color.argb(25, 186, 230, 253), // soft sky-blue mist
-                    Color.argb(6, 14, 165, 233),   // delicate outer edge
-                    Color.argb(0, 14, 165, 233)    // complete fade to dark sky transparent
-                )
-                glowPaint.shader = RadialGradient(0f, 0f, 240f, moonGlowColors, floatArrayOf(0.0f, 0.35f, 0.75f, 1.0f), Shader.TileMode.CLAMP)
-                canvas.drawCircle(0f, 0f, 240f, glowPaint)
-
-                // 2. Draw elegant, faint, slow-rotating moon rays (beams of light)
-                val rayPaint = Paint().apply {
-                    isAntiAlias = true
-                    style = Paint.Style.STROKE
-                    strokeCap = Paint.Cap.ROUND
-                }
-                val pulse = (1f + 0.05f * sin(timeMs / 1800.0).toFloat()) // serene slow pulsing
-                val raySpin = (timeMs % 64000L) / 64000f * -360f // counter-rotation for cosmic balance
-
-                for (i in 0 until 8) {
-                    canvas.save()
-                    canvas.rotate(i * 45f + raySpin)
-                    val startDist = 32f
-                    val endDist = (95f + 15f * sin(timeMs / 1500.0 + i).toFloat()) * pulse
-                    
-                    rayPaint.shader = LinearGradient(0f, startDist, 0f, endDist,
-                        Color.argb(50, 224, 242, 254),
-                        Color.argb(0, 186, 230, 253),
-                        Shader.TileMode.CLAMP
-                    )
-                    rayPaint.strokeWidth = 2f
-                    canvas.drawLine(0f, startDist, 0f, endDist, rayPaint)
-                    canvas.restore()
-                }
-
-                // Gentle blue-gold halo close glow behind moon
-                val haloColors = intArrayOf(Color.argb(80, 186, 230, 253), Color.argb(0, 186, 230, 253))
-                localPaint.style = Paint.Style.FILL
-                localPaint.shader = RadialGradient(0f, 0f, 45f, haloColors, null, Shader.TileMode.CLAMP)
-                canvas.drawCircle(0f, 0f, 45f, localPaint)
-
-                canvas.save()
-                canvas.rotate(rock)
-
-                val outerMoon = Path().apply { addCircle(-4f, 0f, 25f, Path.Direction.CW) }
-                val innerMoon = Path().apply { addCircle(4f, -4f, 23f, Path.Direction.CW) }
-                outerMoon.op(innerMoon, Path.Op.DIFFERENCE)
-
-                localPaint.shader = LinearGradient(-15f, -15f, 15f, 15f,
-                    Color.rgb(254, 240, 138), Color.rgb(251, 191, 36), Shader.TileMode.CLAMP
-                )
-                canvas.drawPath(outerMoon, localPaint)
-
-                // Render craters inside crescent Moon core
-                localPaint.shader = null
-                localPaint.color = Color.argb(18, 0, 0, 0)
-                canvas.drawCircle(-11f, 4f, 3.5f, localPaint)
-                canvas.drawCircle(-4f, -12f, 2.5f, localPaint)
-
+                canvas.rotate(i * 45f + spin)
+                canvas.drawLine(0f, 31f * scaleG, 0f, 40f * scaleG, celestialPaint)
                 canvas.restore()
-                canvas.restore()
+            }
+            canvas.restore()
+        } else if (!isDay) {
+            // Anti-solar position: opposite azimuth, mirrored altitude
+            val moonAltDeg = -sunAltitudeDeg
+            if (moonAltDeg >= -5f) {
+                val moonAz = (sunAzimuthDeg + 180f) % 360f
+                val moonX = viewWidth * (moonAz - 60f) / 240f
+                val moonY = viewHeight * 0.85f *
+                    (1.0f - (sin(-altitude) / sin(maxAltitude)).toFloat().coerceIn(0f, 1f))
+                drawMoon(canvas, moonX, moonY, timeMs)
             }
         }
 
@@ -835,24 +876,29 @@ class AmbientSurfaceView @JvmOverloads constructor(
         // -------------------------------------------------------------
         val condCode = weatherState.conditionId
 
-        // 3a. Clear Night Stars & Twinkling
-        if (!isDay && (condCode == 800 || condCode == 801)) {
-            val starTimeMs = System.currentTimeMillis()
-            for (s in stars) {
-                // Twinkle cycle calculations
-                val phase = (starTimeMs / 1000.0 * s.speed + s.offset).toFloat()
-                val twinkleFactor = 0.4f + 0.6f * (sin(phase) * 0.5f + 0.5f)
-                starPaint.alpha = (s.baseAlpha * twinkleFactor * 255f).toInt().coerceIn(0, 255)
-                canvas.drawCircle(s.x, s.y, 1.2f, starPaint)
+        // 3a. Night stars — visible whenever dark, dimmed through partial cloud
+        if (!isDay) {
+            val cloudDim = 1f - (weatherState.cloudCover / 100f) * 0.85f
+            if (cloudDim > 0.06f) {
+                for (s in stars) {
+                    // Twinkle cycle calculations
+                    val phase = (timeMs / 1000.0 * s.speed + s.offset).toFloat()
+                    val twinkleFactor = 0.4f + 0.6f * (sin(phase) * 0.5f + 0.5f)
+                    val a = (s.baseAlpha * twinkleFactor * cloudDim * 255f).toInt().coerceIn(0, 255)
+                    starPaint.color = Color.argb(a, s.tintR, s.tintG, s.tintB)
+                    canvas.drawCircle(s.x, s.y, s.size, starPaint)
+                }
             }
 
-            // Shooting star line render
+            // Shooting star with a glowing head (active on clear nights only)
             if (shootingStar.active) {
                 val tailX = shootingStar.x - shootingStar.vx * 0.1f
                 val tailY = shootingStar.y - shootingStar.vy * 0.1f
                 val lineAlpha = ((1.0f - shootingStar.progress) * 220f).toInt().coerceIn(0, 255)
                 shootingStarPaint.color = Color.argb(lineAlpha, 255, 255, 255)
                 canvas.drawLine(tailX, tailY, shootingStar.x, shootingStar.y, shootingStarPaint)
+                starPaint.color = Color.argb(lineAlpha, 255, 255, 255)
+                canvas.drawCircle(shootingStar.x, shootingStar.y, 2.2f, starPaint)
             }
         }
 
@@ -860,23 +906,25 @@ class AmbientSurfaceView @JvmOverloads constructor(
         val noPrecip = condCode !in 200..232 && condCode !in 300..531 && condCode !in 600..622 && condCode !in 701..781
         if (noPrecip) {
             if (isDay) {
-                // Sun golden shimmer particles rising up
+                // Rising shimmer motes: pale gold at midday, ember-orange in golden hour
+                val emberMix = (1f - (sunAltitudeDeg / 25f)).coerceIn(0f, 1f)
+                val moteColor = lerpColor(Color.rgb(255, 230, 160), Color.rgb(255, 150, 70), emberMix)
                 for (m in shimmerMotes) {
                     val mAlpha = (m.alpha * 255).toInt().coerceIn(0, 255)
-                    shimmerPaint.color = Color.argb(mAlpha, 255, 230, 160)
+                    shimmerPaint.color = (moteColor and 0x00FFFFFF) or (mAlpha shl 24)
                     canvas.drawCircle(m.x, m.y, m.size, shimmerPaint)
                 }
             } else {
-                // Fireflies slow walk glow pulse
+                // Fireflies slow walk glow pulse (pre-built unit shader, alpha-pulsed)
+                fireflyPaint.shader = fireflyGlowShader
                 for (f in fireflies) {
                     val pulse = 0.4f + 0.6f * (sin(f.pulsePhase) * 0.5f + 0.5f)
-                    val glowColors = intArrayOf(
-                        Color.argb((pulse * 200).toInt(), 180, 255, 0),
-                        Color.argb(0, 180, 255, 0)
-                    )
-                    val flyShader = RadialGradient(f.x, f.y, 6f, glowColors, null, Shader.TileMode.CLAMP)
-                    fireflyPaint.shader = flyShader
-                    canvas.drawCircle(f.x, f.y, 6f, fireflyPaint)
+                    fireflyPaint.alpha = (pulse * 255).toInt()
+                    canvas.save()
+                    canvas.translate(f.x, f.y)
+                    canvas.scale(6f, 6f)
+                    canvas.drawCircle(0f, 0f, 1f, fireflyPaint)
+                    canvas.restore()
                 }
             }
         }
@@ -905,9 +953,16 @@ class AmbientSurfaceView @JvmOverloads constructor(
             val rainIntensityFactor = (weatherState.rainMmH * 100f).coerceIn(50f, 500f)
             val activeRainCount = rainIntensityFactor.toInt()
 
+            // Two-depth parallax rain: dim thin far streaks, bright long near streaks
             for (i in 0 until activeRainCount) {
                 val p = rainParticles[i]
-                rainPaint.color = Color.argb((p.alpha * 255).toInt(), 180, 210, 255)
+                if (p.layer == 0) {
+                    rainPaint.strokeWidth = 1.0f
+                    rainPaint.color = Color.argb((p.alpha * 150).toInt(), 160, 190, 235)
+                } else {
+                    rainPaint.strokeWidth = 1.8f
+                    rainPaint.color = Color.argb((p.alpha * 255).toInt(), 190, 215, 255)
+                }
                 canvas.drawLine(p.x, p.y, p.x + p.vx * 0.02f, p.y + p.length, rainPaint)
             }
 
@@ -942,23 +997,32 @@ class AmbientSurfaceView @JvmOverloads constructor(
 
                 // Draw simple horizontal rolling mist layers using sinusoidal offsets
                 val offset = f.xOffset
-                val path = Path()
-                path.moveTo(0f, f.y)
+                fogPath.reset()
+                fogPath.moveTo(0f, f.y)
                 var xTick = 0f
                 while (xTick <= viewWidth + 40f) {
                     val yTick = f.y + sin((xTick + offset) * 0.01f).toFloat() * 12f
-                    path.lineTo(xTick, yTick)
+                    fogPath.lineTo(xTick, yTick)
                     xTick += 40f
                 }
-                path.lineTo(viewWidth, f.y + f.height)
-                path.lineTo(0f, f.y + f.height)
-                path.close()
-                canvas.drawPath(path, fogPaint)
+                fogPath.lineTo(viewWidth, f.y + f.height)
+                fogPath.lineTo(0f, f.y + f.height)
+                fogPath.close()
+                canvas.drawPath(fogPath, fogPaint)
             }
         }
 
         // 3g. Custom Thunderstorm lightning overlays
         if (condCode in 200..232 && lightningActive) {
+            // Cloud-interior glow around the strike origin, fading with the bolt
+            lightningGlowPaint.shader = lightningGlowShader
+            lightningGlowPaint.alpha = (lightningAlpha * 200f).toInt().coerceIn(0, 255)
+            canvas.save()
+            canvas.translate(lightningX, viewHeight * 0.12f)
+            canvas.scale(viewWidth * 0.28f, viewHeight * 0.22f)
+            canvas.drawCircle(0f, 0f, 1f, lightningGlowPaint)
+            canvas.restore()
+
             // Draw Lightning bolt path
             lightningPaint.alpha = (lightningAlpha * 255).toInt().coerceIn(0, 255)
             canvas.drawPath(lightningPath, lightningPaint)
@@ -990,150 +1054,61 @@ class AmbientSurfaceView @JvmOverloads constructor(
 
 
         // -------------------------------------------------------------
-        // LAYER 5 — THE CLOCK
+        // LAYER 5 — THE CLOCK (cached bitmaps, re-rendered once per minute)
         // -------------------------------------------------------------
+        // Anti burn-in: the clock + info composition slowly orbits a few px
+        val burnX = 3f * sin(timeMs / 480000.0 * 2.0 * Math.PI).toFloat()
+        val burnY = 2f * sin(timeMs / 657000.0 * 2.0 * Math.PI).toFloat()
+        canvas.save()
+        canvas.translate(burnX, burnY)
+
         clockBottomY = viewHeight * 0.65f
         val dnsVal = context.resources.displayMetrics.scaledDensity
 
-        // Check if our off-screen soft blurred bitmap is set up and valid
-        val clockB = clockBmp
-        val clockC = clockCanvas
-        if (clockB != null && clockC != null) {
-            clockB.eraseColor(Color.TRANSPARENT)
-
-            // Dynamic clock details
+        if (clockBmp != null && colonBmp != null) {
             val timeCal = Calendar.getInstance(TimeZone.getTimeZone("Asia/Kolkata"))
             val rawHour = timeCal.get(Calendar.HOUR_OF_DAY)
             val mm = timeCal.get(Calendar.MINUTE)
-            val ss = timeCal.get(Calendar.SECOND)
+            val minuteKey = rawHour * 60 + mm
 
-            // Convert to 12h format
-            val isPm = rawHour >= 12
-            val hour12 = rawHour % 12
-            val hh = if (hour12 == 0) 12 else hour12
-            val amPmStr = if (isPm) "PM" else "AM"
-
-            val hoursStr = String.format("%d", hh)
-            val minsStr = String.format("%02d", mm)
-
-            val clockTextSize = 182f * dnsVal
-
-            clockFontPaint.textSize = clockTextSize
-            clockGlowPaint.textSize = clockTextSize
-
-            // AM/PM paint setting (subscript styled)
-            val amPmTextSize = clockTextSize * 0.18f
-            val amPmPaint = Paint().apply {
-                isAntiAlias = true
-                typeface = Typeface.create("sans-serif", Typeface.BOLD)
-                textSize = amPmTextSize
-                color = Color.WHITE
-            }
-            val amPmGlowPaint = Paint().apply {
-                isAntiAlias = true
-                typeface = Typeface.create("sans-serif", Typeface.BOLD)
-                textSize = amPmTextSize
+            if (minuteKey != cachedClockMinute) {
+                // Swap current into previous for the crossfade, then re-render.
+                // Glow tint (sky-reactive) also refreshes here, once per minute.
+                val swapBmp = prevClockBmp
+                val swapCanvas = prevClockCanvas
+                prevClockBmp = clockBmp
+                prevClockCanvas = clockCanvas
+                clockBmp = swapBmp
+                clockCanvas = swapCanvas
+                renderClockCache(rawHour, mm, dnsVal)
+                clockSwapTimeMs = if (cachedClockMinute == -1) 0L else timeMs
+                cachedClockMinute = minuteKey
             }
 
-            // Layout computations for centering [HH] [:] [MM]   [AM/PM] on the canvas
-            val wHrs = clockFontPaint.measureText(hoursStr)
-            val wCol = clockFontPaint.measureText(":")
-            val wMin = clockFontPaint.measureText(minsStr)
-            val wAmPm = amPmPaint.measureText(amPmStr)
-            
-            val amPmGap = 16f * dnsVal
-            val grandW = wHrs + wCol + wMin + amPmGap + wAmPm
+            val curB = clockBmp!!
+            val finalL = (viewWidth - curB.width) / 2f
+            val finalT = (viewHeight - curB.height) / 2f - 68f * dnsVal // Shift up slightly to balance date bar
 
-            val clockX = (clockB.width - grandW) / 2f
-            val clockY = clockB.height / 2f - (clockFontPaint.ascent() + clockFontPaint.descent()) / 2f
-            val amPmX = clockX + wHrs + wCol + wMin + amPmGap
-
-            // Colon blinking calculations at 0.5Hz
-            val cycleMs = System.currentTimeMillis() % 2000L
-            val colonAlphaPct = if (cycleMs < 1000L) {
-                // Linear decay and fade up
-                0.4f + 0.6f * (cycleMs / 1000f)
+            // Minute-change crossfade (400ms)
+            val fade = ((timeMs - clockSwapTimeMs) / 400f).coerceIn(0f, 1f)
+            val prevB = prevClockBmp
+            if (fade < 1f && prevB != null) {
+                clockBmpPaint.alpha = ((1f - fade) * 255).toInt()
+                canvas.drawBitmap(prevB, finalL, finalT, clockBmpPaint)
+                clockBmpPaint.alpha = (fade * 255).toInt()
+                canvas.drawBitmap(curB, finalL, finalT, clockBmpPaint)
             } else {
-                0.4f + 0.6f * ((2000L - cycleMs) / 1000f)
+                clockBmpPaint.alpha = 255
+                canvas.drawBitmap(curB, finalL, finalT, clockBmpPaint)
             }
 
-            // Glow color schemes support (Warm amber Day vs Cosmic blue Night)
-            val glowColor = if (isDay) {
-                Color.rgb(255, 185, 50)  // Gold/Amber
-            } else {
-                Color.rgb(100, 180, 255) // Cyan/Blue
-            }
-
-            // PASS 1: TextSize, BlurMaskFilter(40f, Normal), alpha 0.3
-            clockGlowPaint.color = glowColor
-            amPmGlowPaint.color = glowColor
-            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
-                clockGlowPaint.maskFilter = BlurMaskFilter(40f, BlurMaskFilter.Blur.NORMAL)
-                amPmGlowPaint.maskFilter = BlurMaskFilter(40f, BlurMaskFilter.Blur.NORMAL)
-            }
-            clockGlowPaint.alpha = (0.3f * 255).toInt()
-            amPmGlowPaint.alpha = (0.3f * 255).toInt()
-            
-            clockC.drawText(hoursStr, clockX, clockY, clockGlowPaint)
-            clockC.drawText(minsStr, clockX + wHrs + wCol, clockY, clockGlowPaint)
-            clockC.drawText(amPmStr, amPmX, clockY, amPmGlowPaint)
-            
-            clockGlowPaint.alpha = (0.3f * colonAlphaPct * 255).toInt()
-            clockC.drawText(":", clockX + wHrs, clockY, clockGlowPaint)
-
-            // PASS 2: TextSize, BlurMaskFilter(20f, Normal), alpha 0.5
-            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
-                clockGlowPaint.maskFilter = BlurMaskFilter(20f, BlurMaskFilter.Blur.NORMAL)
-                amPmGlowPaint.maskFilter = BlurMaskFilter(20f, BlurMaskFilter.Blur.NORMAL)
-            }
-            clockGlowPaint.alpha = (0.5f * 255).toInt()
-            amPmGlowPaint.alpha = (0.5f * 255).toInt()
-            
-            clockC.drawText(hoursStr, clockX, clockY, clockGlowPaint)
-            clockC.drawText(minsStr, clockX + wHrs + wCol, clockY, clockGlowPaint)
-            clockC.drawText(amPmStr, amPmX, clockY, amPmGlowPaint)
-            
-            clockGlowPaint.alpha = (0.5f * colonAlphaPct * 255).toInt()
-            clockC.drawText(":", clockX + wHrs, clockY, clockGlowPaint)
-
-            // PASS 3: TextSize, BlurMaskFilter(8f, Normal), alpha 0.8
-            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
-                clockGlowPaint.maskFilter = BlurMaskFilter(8f, BlurMaskFilter.Blur.NORMAL)
-                amPmGlowPaint.maskFilter = BlurMaskFilter(8f, BlurMaskFilter.Blur.NORMAL)
-            }
-            clockGlowPaint.alpha = (0.8f * 255).toInt()
-            amPmGlowPaint.alpha = (0.8f * 255).toInt()
-            
-            clockC.drawText(hoursStr, clockX, clockY, clockGlowPaint)
-            clockC.drawText(minsStr, clockX + wHrs + wCol, clockY, clockGlowPaint)
-            clockC.drawText(amPmStr, amPmX, clockY, amPmGlowPaint)
-            
-            clockGlowPaint.alpha = (0.8f * colonAlphaPct * 255).toInt()
-            clockC.drawText(":", clockX + wHrs, clockY, clockGlowPaint)
-
-            // PASS 4: TextSize, Sharp White Core
-            clockFontPaint.maskFilter = null
-            clockFontPaint.color = Color.WHITE
-            clockFontPaint.alpha = 255
-            clockC.drawText(hoursStr, clockX, clockY, clockFontPaint)
-            clockC.drawText(minsStr, clockX + wHrs + wCol, clockY, clockFontPaint)
-
-            amPmPaint.maskFilter = null
-            amPmPaint.color = Color.WHITE
-            amPmPaint.alpha = 220
-            clockC.drawText(amPmStr, amPmX, clockY, amPmPaint)
-
-            // Sharp core colon blinking
-            clockFontPaint.alpha = (colonAlphaPct * 255).toInt().coerceIn(100, 255)
-            clockC.drawText(":", clockX + wHrs, clockY, clockFontPaint)
-
-            // Draw the completed soft composited clock bitmap onto our hardware canvas
-            val finalL = (viewWidth - clockB.width) / 2f
-            val finalT = (viewHeight - clockB.height) / 2f - 68f * dnsVal // Shift up slightly to balance date bar
-            canvas.drawBitmap(clockB, finalL, finalT, null)
+            // Breathing colon: soft sine ease on the cached full-brightness colon
+            val breathe = (0.5 + 0.5 * sin(timeMs / 2000.0 * 2.0 * Math.PI - Math.PI / 2.0)).toFloat()
+            colonBmpPaint.alpha = ((0.35f + 0.65f * breathe) * 255).toInt()
+            canvas.drawBitmap(colonBmp!!, finalL, finalT, colonBmpPaint)
 
             // Set highly precise clock bottom baseline relative to layout
-            clockBottomY = finalT + clockY + clockFontPaint.descent() + 25f * dnsVal
+            clockBottomY = finalT + clockBaselineInBmp + 25f * dnsVal
         }
 
          // -------------------------------------------------------------
@@ -1168,9 +1143,7 @@ class AmbientSurfaceView @JvmOverloads constructor(
         dateGlowPaint.color = dateBaseColor
         dateGlowPaint.textSize = 21.5f * dns
         dateGlowPaint.typeface = Typeface.create("sans-serif", Typeface.BOLD)
-        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
-            dateGlowPaint.maskFilter = BlurMaskFilter(6f, BlurMaskFilter.Blur.NORMAL)
-        }
+        dateGlowPaint.maskFilter = blur6
         dateGlowPaint.alpha = (0.35f * dateBarAlpha * 255).toInt()
 
         // Render Date Line (Clock bottom + 14px)
@@ -1181,58 +1154,42 @@ class AmbientSurfaceView @JvmOverloads constructor(
 
         // Render sleek fading horizontal divider line (14px below Date Line)
         val dividerY = l1Y + 18f
-        val dividerPaint = Paint().apply {
-            isAntiAlias = true
-            strokeWidth = 1.6f * dns
-            style = Paint.Style.STROKE
-        }
+        dividerPaint.strokeWidth = 1.6f * dns
         val dividerHalfW = viewWidth * 0.28f // Beautiful, short, concentrated divider
-        val lineGradient = LinearGradient(
-            viewWidth / 2f - dividerHalfW, dividerY,
-            viewWidth / 2f + dividerHalfW, dividerY,
-            intArrayOf(Color.TRANSPARENT, Color.argb((0.45f * dateBarAlpha * 255).toInt(), 180, 215, 255), Color.TRANSPARENT),
-            floatArrayOf(0f, 0.5f, 1f),
-            Shader.TileMode.CLAMP
-        )
-        dividerPaint.shader = lineGradient
+        val dividerAlphaInt = (0.45f * dateBarAlpha * 255).toInt()
+        if (dividerAlphaInt != dividerShaderAlpha) {
+            // Horizontal gradient is y-independent; rebuild only when alpha moves
+            dividerShaderAlpha = dividerAlphaInt
+            dividerPaint.shader = LinearGradient(
+                viewWidth / 2f - dividerHalfW, 0f,
+                viewWidth / 2f + dividerHalfW, 0f,
+                intArrayOf(Color.TRANSPARENT, Color.argb(dividerAlphaInt, 180, 215, 255), Color.TRANSPARENT),
+                floatArrayOf(0f, 0.5f, 1f),
+                Shader.TileMode.CLAMP
+            )
+        }
         canvas.drawLine(viewWidth / 2f - dividerHalfW, dividerY, viewWidth / 2f + dividerHalfW, dividerY, dividerPaint)
 
         // -------------------------------------------------------------
         // ROW 1 — Current Weather Highlight (Divider + 38px)
         // -------------------------------------------------------------
         val r1Y = dividerY + 38f
-        
-        // Setup specialized fonts/sizes for row 1 (Significantly Upgraded Size!)
-        val tempPaint = Paint().apply {
-            isAntiAlias = true
-            typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
-            textSize = 38f * dns
-            color = Color.WHITE
-        }
-        val tempGlowPaint = Paint().apply {
-            isAntiAlias = true
-            typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
-            textSize = 38f * dns
-            color = if (isDay) Color.rgb(255, 185, 50) else Color.rgb(100, 180, 255)
-            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
-                maskFilter = BlurMaskFilter(15f, BlurMaskFilter.Blur.NORMAL)
-            }
-            alpha = (0.4f * dateBarAlpha * 255).toInt()
-        }
 
-        val descPaint = Paint().apply {
-            isAntiAlias = true
-            typeface = Typeface.create("sans-serif-medium", Typeface.BOLD)
-            textSize = 19f * dns
-            color = Color.argb((0.8f * dateBarAlpha * 255).toInt(), 200, 220, 245)
-        }
+        // Configure row 1 field paints (allocated once, tuned per frame)
+        tempPaint.textSize = 38f * dns
+        tempPaint.color = Color.WHITE
+        tempPaint.alpha = (dateBarAlpha * 255).toInt()
 
-        val locationPaint = Paint().apply {
-            isAntiAlias = true
-            typeface = Typeface.create("sans-serif", Typeface.BOLD)
-            textSize = 19f * dns
-            color = Color.argb((0.5f * dateBarAlpha * 255).toInt(), 160, 190, 225)
-        }
+        tempGlowPaint.textSize = 38f * dns
+        tempGlowPaint.color = glowColorForAltitude(sunAltitudeDeg)
+        tempGlowPaint.maskFilter = blur15
+        tempGlowPaint.alpha = (0.4f * dateBarAlpha * 255).toInt()
+
+        descPaint.textSize = 19f * dns
+        descPaint.color = Color.argb((0.8f * dateBarAlpha * 255).toInt(), 200, 220, 245)
+
+        locationPaint.textSize = 19f * dns
+        locationPaint.color = Color.argb((0.5f * dateBarAlpha * 255).toInt(), 160, 190, 225)
 
         val tempStr = "${currentTemp}°C"
         val locationStr = WeatherRepository.LOCATION_LABEL.uppercase()
@@ -1279,12 +1236,8 @@ class AmbientSurfaceView @JvmOverloads constructor(
         // -------------------------------------------------------------
         val r2Y = r1Y + 36f * dns
 
-        val metricPaint = Paint().apply {
-            isAntiAlias = true
-            typeface = Typeface.create("sans-serif", Typeface.BOLD)
-            textSize = 16.5f * dns
-            color = Color.argb((0.65f * dateBarAlpha * 255).toInt(), 180, 205, 235)
-        }
+        metricPaint.textSize = 16.5f * dns
+        metricPaint.color = Color.argb((0.65f * dateBarAlpha * 255).toInt(), 180, 205, 235)
 
         // We prepare our items (Enlarged)
         val iconSize = 23.5f * dns // Increased from 18f
@@ -1317,19 +1270,14 @@ class AmbientSurfaceView @JvmOverloads constructor(
         val yTri = r2Y - 5.5f * dns
         
         // draw up triangle (orange accent)
-        val pUp = Path().apply {
-            moveTo(xT1, yTri - triSize / 2f)
-            lineTo(xT1 - triSize * 0.8f, yTri + triSize / 2f)
-            lineTo(xT1 + triSize * 0.8f, yTri + triSize / 2f)
-            close()
-        }
-        val triPaint = Paint().apply {
-            isAntiAlias = true
-            style = Paint.Style.FILL
-            color = Color.rgb(255, 120, 50)
-            alpha = (dateBarAlpha * 255).toInt()
-        }
-        canvas.drawPath(pUp, triPaint)
+        triPathUp.reset()
+        triPathUp.moveTo(xT1, yTri - triSize / 2f)
+        triPathUp.lineTo(xT1 - triSize * 0.8f, yTri + triSize / 2f)
+        triPathUp.lineTo(xT1 + triSize * 0.8f, yTri + triSize / 2f)
+        triPathUp.close()
+        triPaint.color = Color.rgb(255, 120, 50)
+        triPaint.alpha = (dateBarAlpha * 255).toInt()
+        canvas.drawPath(triPathUp, triPaint)
 
         val xHighText = xT1 + triSize + 4f * dns
         canvas.drawText("H:${limitHigh}° ", xHighText, r2Y, metricPaint)
@@ -1337,14 +1285,14 @@ class AmbientSurfaceView @JvmOverloads constructor(
 
         // draw down triangle (cool blue accent)
         val xT2 = xHighText + wH + triSize * 0.8f
-        val pDown = Path().apply {
-            moveTo(xT2, yTri + triSize / 2f)
-            lineTo(xT2 - triSize * 0.8f, yTri - triSize / 2f)
-            lineTo(xT2 + triSize * 0.8f, yTri - triSize / 2f)
-            close()
-        }
+        triPathDown.reset()
+        triPathDown.moveTo(xT2, yTri + triSize / 2f)
+        triPathDown.lineTo(xT2 - triSize * 0.8f, yTri - triSize / 2f)
+        triPathDown.lineTo(xT2 + triSize * 0.8f, yTri - triSize / 2f)
+        triPathDown.close()
         triPaint.color = Color.rgb(80, 180, 255)
-        canvas.drawPath(pDown, triPaint)
+        triPaint.alpha = (dateBarAlpha * 255).toInt()
+        canvas.drawPath(triPathDown, triPaint)
 
         canvas.drawText("L:${limitLow}°", xT2 + triSize + 4f * dns, r2Y, metricPaint)
 
@@ -1357,6 +1305,206 @@ class AmbientSurfaceView @JvmOverloads constructor(
         val xWindStart = xHumStart + item2W + colGap
         drawMiniWind(canvas, xWindStart + iconSize / 2f, r2Y - 5.5f * dns, iconSize, metricPaint)
         canvas.drawText(windText, xWindStart + iconSize + iconGap, r2Y, metricPaint)
+
+        // Close the anti burn-in drift transform opened before LAYER 5
+        canvas.restore()
+    }
+
+    // Sky palette keyframes across the solar day (sun altitude in degrees):
+    // deep night → astronomical twilight → blue hour → golden hour → sunrise → morning → midday
+    private val skyKeyAlts = floatArrayOf(-30f, -14f, -7f, -2f, 3f, 10f, 30f)
+    private val skyKeyTops = intArrayOf(
+        Color.parseColor("#020408"),
+        Color.parseColor("#050B20"),
+        Color.parseColor("#0B1240"),
+        Color.parseColor("#2A1348"),
+        Color.parseColor("#234A8C"),
+        Color.parseColor("#1B62B8"),
+        Color.parseColor("#1565C0")
+    )
+    private val skyKeyBottoms = intArrayOf(
+        Color.parseColor("#0A1128"),
+        Color.parseColor("#12204A"),
+        Color.parseColor("#3A3670"),
+        Color.parseColor("#E86A2B"),
+        Color.parseColor("#F2954A"),
+        Color.parseColor("#6FB1E8"),
+        Color.parseColor("#42A5F5")
+    )
+
+    private fun skyColorsForAltitude(altDeg: Float): Pair<Int, Int> {
+        if (altDeg <= skyKeyAlts.first()) return skyKeyTops.first() to skyKeyBottoms.first()
+        if (altDeg >= skyKeyAlts.last()) return skyKeyTops.last() to skyKeyBottoms.last()
+        for (i in 0 until skyKeyAlts.size - 1) {
+            if (altDeg <= skyKeyAlts[i + 1]) {
+                val f = (altDeg - skyKeyAlts[i]) / (skyKeyAlts[i + 1] - skyKeyAlts[i])
+                return lerpColor(skyKeyTops[i], skyKeyTops[i + 1], f) to
+                        lerpColor(skyKeyBottoms[i], skyKeyBottoms[i + 1], f)
+            }
+        }
+        return skyKeyTops.last() to skyKeyBottoms.last()
+    }
+
+    /**
+     * Sky-reactive glow tint: ice blue at night, rose through twilight,
+     * warm amber in full daylight.
+     */
+    private fun glowColorForAltitude(altDeg: Float): Int {
+        val night = Color.rgb(100, 180, 255)
+        val twilight = Color.rgb(255, 140, 110)
+        val day = Color.rgb(255, 185, 50)
+        return when {
+            altDeg <= -12f -> night
+            altDeg <= 0f -> lerpColor(night, twilight, (altDeg + 12f) / 12f)
+            altDeg <= 10f -> lerpColor(twilight, day, altDeg / 10f)
+            else -> day
+        }
+    }
+
+    /**
+     * Renders glowing digits + AM/PM into clockBmp and the colon (at full
+     * brightness) into colonBmp. Called once per minute instead of re-blurring
+     * the huge text every frame — the colon breathes via draw-time alpha.
+     */
+    private fun renderClockCache(rawHour: Int, mm: Int, dnsVal: Float) {
+        val clockB = clockBmp ?: return
+        val clockC = clockCanvas ?: return
+        val colonB = colonBmp ?: return
+        val colonC = colonCanvas ?: return
+
+        clockB.eraseColor(Color.TRANSPARENT)
+        colonB.eraseColor(Color.TRANSPARENT)
+
+        val isPm = rawHour >= 12
+        val hour12 = rawHour % 12
+        val hh = if (hour12 == 0) 12 else hour12
+        val amPmStr = if (isPm) "PM" else "AM"
+        val hoursStr = String.format("%d", hh)
+        val minsStr = String.format("%02d", mm)
+
+        val clockTextSize = 182f * dnsVal
+        clockFontPaint.textSize = clockTextSize
+        clockGlowPaint.textSize = clockTextSize
+
+        val amPmTextSize = clockTextSize * 0.18f
+        amPmPaint.textSize = amPmTextSize
+        amPmGlowPaint.textSize = amPmTextSize
+
+        // Layout computations for centering [HH] [:] [MM]   [AM/PM]
+        val wHrs = clockFontPaint.measureText(hoursStr)
+        val wCol = clockFontPaint.measureText(":")
+        val wMin = clockFontPaint.measureText(minsStr)
+        val wAmPm = amPmPaint.measureText(amPmStr)
+
+        val amPmGap = 16f * dnsVal
+        val grandW = wHrs + wCol + wMin + amPmGap + wAmPm
+
+        val clockX = (clockB.width - grandW) / 2f
+        val clockY = clockB.height / 2f - (clockFontPaint.ascent() + clockFontPaint.descent()) / 2f
+        val colonX = clockX + wHrs
+        val minsX = clockX + wHrs + wCol
+        val amPmX = minsX + wMin + amPmGap
+
+        val glowColor = glowColorForAltitude(sunAltitudeDeg)
+        clockGlowPaint.color = glowColor
+        amPmGlowPaint.color = glowColor
+
+        // Three soft glow passes (40/20/8px) then the sharp white core
+        val passAlphas = floatArrayOf(0.3f, 0.5f, 0.8f)
+        val passBlurs = arrayOf(blur40, blur20, blur8)
+        for (i in passAlphas.indices) {
+            clockGlowPaint.maskFilter = passBlurs[i]
+            amPmGlowPaint.maskFilter = passBlurs[i]
+            val a = (passAlphas[i] * 255).toInt()
+            clockGlowPaint.alpha = a
+            amPmGlowPaint.alpha = a
+            clockC.drawText(hoursStr, clockX, clockY, clockGlowPaint)
+            clockC.drawText(minsStr, minsX, clockY, clockGlowPaint)
+            clockC.drawText(amPmStr, amPmX, clockY, amPmGlowPaint)
+            colonC.drawText(":", colonX, clockY, clockGlowPaint)
+        }
+
+        clockFontPaint.maskFilter = null
+        clockFontPaint.color = Color.WHITE
+        clockFontPaint.alpha = 255
+        clockC.drawText(hoursStr, clockX, clockY, clockFontPaint)
+        clockC.drawText(minsStr, minsX, clockY, clockFontPaint)
+        colonC.drawText(":", colonX, clockY, clockFontPaint)
+
+        amPmPaint.maskFilter = null
+        amPmPaint.color = Color.WHITE
+        amPmPaint.alpha = 220
+        clockC.drawText(amPmStr, amPmX, clockY, amPmPaint)
+
+        clockBaselineInBmp = clockY + clockFontPaint.descent()
+    }
+
+    /**
+     * Moon with real phase shading from weatherState.moonPhase
+     * (0 = new, 0.5 = full, 1 = new again).
+     */
+    private fun drawMoon(canvas: Canvas, x: Float, y: Float, timeMs: Long) {
+        canvas.save()
+        canvas.translate(x, y)
+        canvas.scale(1.2f, 1.2f)
+
+        val rock = 4f * sin(timeMs / 2000.0).toFloat() // slow swaying
+        val phase = weatherState.moonPhase
+        val illum = (0.5f * (1f - cos(2.0 * Math.PI * phase).toFloat())).coerceIn(0f, 1f) // 0 new → 1 full
+
+        // 1. Ambient moonlight glow, brighter toward full moon
+        celestialGlowPaint.shader = moonGlowShader
+        celestialGlowPaint.alpha = (120 + 135 * illum).toInt().coerceIn(0, 255)
+        canvas.drawCircle(0f, 0f, 240f, celestialGlowPaint)
+
+        // 2. Faint counter-rotating light beams
+        val pulse = (1f + 0.05f * sin(timeMs / 1800.0).toFloat())
+        val raySpin = (timeMs % 64000L) / 64000f * -360f
+        celestialRayPaint.shader = null
+        celestialRayPaint.color = Color.argb((25 + 30 * illum).toInt(), 224, 242, 254)
+        celestialRayPaint.strokeWidth = 2f
+        for (i in 0 until 8) {
+            canvas.save()
+            canvas.rotate(i * 45f + raySpin)
+            val endDist = (95f + 15f * sin(timeMs / 1500.0 + i).toFloat()) * pulse
+            canvas.drawLine(0f, 32f, 0f, endDist, celestialRayPaint)
+            canvas.restore()
+        }
+
+        // 3. Close halo
+        celestialPaint.style = Paint.Style.FILL
+        celestialPaint.strokeCap = Paint.Cap.BUTT
+        celestialPaint.shader = moonHaloShader
+        canvas.drawCircle(0f, 0f, 45f, celestialPaint)
+
+        canvas.save()
+        canvas.rotate(rock)
+
+        // 4. Faint earthshine disc behind the lit portion
+        celestialPaint.shader = null
+        celestialPaint.color = Color.argb(45, 120, 150, 190)
+        canvas.drawCircle(0f, 0f, 25f, celestialPaint)
+
+        // 5. Lit portion: full disc minus a shadow disc swept by the cycle.
+        //    Waxing pushes the shadow left (lit on the right), waning mirrors it.
+        val moonPath = Path().apply { addCircle(0f, 0f, 25f, Path.Direction.CW) }
+        if (illum < 0.985f) {
+            val shadowOffset = illum * 50f
+            val shadowX = if (phase < 0.5f) -shadowOffset else shadowOffset
+            val shadowPath = Path().apply { addCircle(shadowX, 0f, 25f, Path.Direction.CW) }
+            moonPath.op(shadowPath, Path.Op.DIFFERENCE)
+        }
+        celestialPaint.shader = moonBodyShader
+        canvas.drawPath(moonPath, celestialPaint)
+
+        // 6. Craters inside the lit body
+        celestialPaint.shader = null
+        celestialPaint.color = Color.argb(18, 0, 0, 0)
+        canvas.drawCircle(-11f, 4f, 3.5f, celestialPaint)
+        canvas.drawCircle(-4f, -12f, 2.5f, celestialPaint)
+
+        canvas.restore()
+        canvas.restore()
     }
 
     private fun drawMiniWeatherIcon(canvas: Canvas, cx: Float, cy: Float, size: Float, condCode: Int, paint: Paint) {
@@ -1367,15 +1515,9 @@ class AmbientSurfaceView @JvmOverloads constructor(
         val isDay = isDayTime()
         val timeMs = System.currentTimeMillis()
         val nowSec = timeMs / 1000L
-        
-        // Define standard Meteocon cloud path shape (logical coord space: -50 to 50)
-        val baseCloudPath = Path().apply {
-            addCircle(-15f, 3f, 11f, Path.Direction.CW)
-            addCircle(15f, 4f, 10f, Path.Direction.CW)
-            addCircle(0f, -8f, 16f, Path.Direction.CW)
-            addRoundRect(RectF(-22f, 1f, 22f, 15f), 7f, 7f, Path.Direction.CW)
-        }
-        
+
+        // (Cloud silhouette shape lives in the shared baseCloudPath field)
+
         // Dynamic twilight detection to automatically transition clear conditions into Sunrise/Sunset cases
         val nearSunrise = abs(nowSec - weatherState.sunriseEpoch) <= 1800L
         val nearSunset = abs(nowSec - weatherState.sunsetEpoch) <= 1800L
@@ -1391,9 +1533,7 @@ class AmbientSurfaceView @JvmOverloads constructor(
         canvas.translate(cx, cy)
         canvas.scale(size / 100f, size / 100f)
 
-        val localPaint = Paint().apply {
-            isAntiAlias = true
-        }
+        val localPaint = iconPaint // shared, fully reset before every use
 
         fun resetLocal(p: Paint) {
             p.shader = null
@@ -1960,23 +2100,7 @@ class AmbientSurfaceView @JvmOverloads constructor(
         val pulse = 1.0f + 0.05f * sin(timeMs / 400.0).toFloat()
         canvas.scale(pulse, pulse)
 
-        val dropletPaint = Paint().apply {
-            isAntiAlias = true
-            style = Paint.Style.FILL
-            shader = LinearGradient(0f, -30f, 0f, 35f,
-                Color.rgb(96, 165, 250),
-                Color.rgb(37, 99, 235),
-                Shader.TileMode.CLAMP
-            )
-        }
-
-        val rPath = Path().apply {
-            moveTo(0f, -35f)
-            cubicTo(20f, 0f, 25f, 25f, 0f, 35f)
-            cubicTo(-25f, 25f, -20f, 0f, 0f, -35f)
-            close()
-        }
-        canvas.drawPath(rPath, dropletPaint)
+        canvas.drawPath(dropletPath, dropletPaint)
         
         canvas.restore()
         paint.style = origStyle
@@ -1994,43 +2118,17 @@ class AmbientSurfaceView @JvmOverloads constructor(
         
         val timeMs = System.currentTimeMillis()
         val travel = (timeMs % 1500L) / 1500f
-        
-        val trackPaint = Paint().apply {
-            isAntiAlias = true
-            style = Paint.Style.STROKE
-            color = Color.argb(80, 203, 213, 225)
-            strokeWidth = 6f
-            strokeCap = Paint.Cap.ROUND
-        }
-        
-        val flowPaint = Paint().apply {
-            isAntiAlias = true
-            style = Paint.Style.STROKE
-            color = Color.rgb(241, 245, 249)
-            strokeWidth = 6f
-            strokeCap = Paint.Cap.ROUND
-            pathEffect = DashPathEffect(floatArrayOf(15f, 40f), -travel * 55f)
-        }
-        
-        val p = Path().apply {
-            moveTo(-45f, 0f)
-            lineTo(15f, 0f)
-            cubicTo(32f, 0f, 32f, -18f, 18f, -18f)
-            cubicTo(8f, -18f, 8f, -6f, 16f, -6f)
-        }
-        
-        canvas.drawPath(p, trackPaint)
-        canvas.drawPath(p, flowPaint)
+
+        // DashPathEffect phase is immutable, so this small alloc is unavoidable
+        windFlowPaint.pathEffect = DashPathEffect(floatArrayOf(15f, 40f), -travel * 55f)
+
+        canvas.drawPath(windPath, windTrackPaint)
+        canvas.drawPath(windPath, windFlowPaint)
         
         canvas.restore()
         paint.style = origStyle
         paint.color = origColor
         paint.strokeWidth = origStroke
-    }
-
-    private fun isNightTime(overrideMs: Long = System.currentTimeMillis()): Boolean {
-        val nowSec = overrideMs / 1000L
-        return nowSec < weatherState.sunriseEpoch || nowSec > weatherState.sunsetEpoch
     }
 
     // Secondary state structural data models designed for particles
@@ -2041,6 +2139,7 @@ class AmbientSurfaceView @JvmOverloads constructor(
         var vx = 0f
         var alpha = 0f
         var length = 0f
+        var layer = 0 // 0 = far (slow, dim), 1 = near (fast, bright)
     }
 
     private class SplashParticle {
@@ -2084,6 +2183,10 @@ class AmbientSurfaceView @JvmOverloads constructor(
         var baseAlpha = 0f
         var speed = 0f
         var offset = 0f
+        var size = 1.2f
+        var tintR = 255
+        var tintG = 255
+        var tintB = 255
     }
 
     private class ShimmerMote {
