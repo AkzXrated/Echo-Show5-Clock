@@ -264,7 +264,8 @@ class MainActivity : ComponentActivity() {
             }
             background = circle
             setOnClickListener {
-                hideSettingsOverlay()
+                settingsOverlay.visibility = View.GONE
+                hideSystemUI()
             }
         }
         cardHeader.addView(closeBtn)
@@ -574,7 +575,8 @@ class MainActivity : ComponentActivity() {
                         Toast.makeText(this@MainActivity, "Weather synced successfully!", Toast.LENGTH_SHORT).show()
 
                         // Hide settings view
-                        hideSettingsOverlay()
+                        settingsOverlay.visibility = View.GONE
+                        hideSystemUI()
                     } else {
                         // Failure! Show detailed error statement to user
                         statusText.text = errorReason
@@ -617,17 +619,7 @@ class MainActivity : ComponentActivity() {
             }
         }
 
-        settingsOverlay.alpha = 0f
         settingsOverlay.visibility = View.VISIBLE
-        settingsOverlay.animate().alpha(1f).setDuration(200).start()
-    }
-
-    private fun hideSettingsOverlay() {
-        settingsOverlay.animate().alpha(0f).setDuration(180).withEndAction {
-            settingsOverlay.visibility = View.GONE
-            settingsOverlay.alpha = 1f
-        }.start()
-        hideSystemUI()
     }
 
     override fun onDestroy() {
